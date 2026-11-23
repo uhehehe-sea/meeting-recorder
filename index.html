@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>아침회의 녹음 v0.1</title>
+<style>
+body{font-family:-apple-system,sans-serif;margin:0;padding:16px;background:#0f172a;color:#e2e8f0}
+h1{font-size:20px}.card{background:#1e293b;border-radius:12px;padding:14px;margin:12px 0}
+label{display:flex;justify-content:space-between;align-items:center;padding:8px 0;font-size:16px}
+button{width:100%;min-height:56px;font-size:18px;border:0;border-radius:12px;margin:6px 0;color:#fff}
+#rec{background:#dc2626}#stop{background:#475569}#mark{background:#2563eb}
+#meter{height:14px;background:#334155;border-radius:7px;overflow:hidden}#bar{height:100%;width:0;background:#22c55e}
+#log,#txt{font-size:14px;white-space:pre-wrap;max-height:220px;overflow:auto}
+a{color:#93c5fd;display:block;margin-top:8px}
+</style></head><body>
+<h1>아침회의 녹음 v0.1</h1>
+<div class="card">
+<b>1. 브라우저 마이크 옵션</b>
+<label>자동 음량 조절 (멀리 있는 목소리 키움)<input type="checkbox" id="agc" checked></label>
+<label>브라우저 소음 제거 (작은 말소리가 잘릴 수 있음)<input type="checkbox" id="ns"></label>
+<label>에코 제거<input type="checkbox" id="ec"></label>
+<b>2·3. 녹음 중 소리 다듬기</b>
+<label>저음 웅웅거림 제거 (90Hz 이하)<input type="checkbox" id="hp" checked></label>
+<label>컴프레서 (작은 소리 키우고 큰 소리 누름)<input type="checkbox" id="comp" checked></label>
+<label>AI 소음 제거 RNNoise (실험)<input type="checkbox" id="rnn"></label>
+<b>4. 녹음 후</b>
+<label>음량 정규화 (-1dB 기준)<input type="checkbox" id="norm" checked></label>
+</div>
+<div id="meter"><div id="bar"></div></div>
+<button id="rec">● 녹음 시작</button>
+<button id="mark" disabled>안건 구분 (여기서 새 업무 시작)</button>
+<button id="stop" disabled>■ 정지</button>
+<div class="card"><b>실시간 텍스트 (현재 방식: 브라우저 음성 인식)</b><div id="txt"></div></div>
+<div class="card"><b>기록</b><div id="log"></div><div id="out"></div></div>
+<script type="module">
+const $=id=>document.getElementById(id);
+let ctx,stream,rec,chunks=[],t0,marks=[],sr,finalText='',running=false,raf;
+const log=m=>$('log').textContent+=`[${new Date().toLocaleTimeString()}] ${m}\n`;
+const el=()=>((Date.now()-t0)/1000).toFixed(1);
+
+$('rec').onclick=async()=>{
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({audio:{
+   autoGainControl:$('agc').checked,noiseSuppression:$('ns').checked,echoCancellation:$('ec').checked,channelCount:1}});
+  ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+  let node=ctx.createMediaStreamSource(stream);
+  if($('hp').checked){const f=ctx.createBiquadFilter();f.type='highpass';f.frequency.value=90;node.connect(f);node=f;}
+  if($('rnn').checked){
+   try{
+    const m=await import('https://cdn.jsdelivr.net/npm/@sapphi-red/web-noise-suppressor@0.3.5/+esm');
+    const base='https://cdn.jsdelivr.net/npm/@sapphi-red/web-noise-suppressor@0.3.5/dist/';
+    const wasm=await m.loadRnnoise({url:base+'rnnoise.wasm',simdUrl:base+'rnnoise_simd.wasm'});
+    await ctx.audioWorklet.addModule(base+'rnnoise/workletProcessor.js');
+    const r=new m.RnnoiseWorkletNode(ctx,{wasmBinary:wasm,maxChannels:1});node.connect(r);node=r;log('RNNoise 켜짐');
+   }catch(e){log('RNNoise 실패 → 건너뜀 (오프라인이거나 미지원): '+e.message);}
+  }
+  if($('comp').checked){const c=ctx.createDynamicsCompressor();c.threshold.value=-40;c.knee.value=20;c.ratio.value=6;c.attack.value=0.005;c.release.value=0.25;
+   const g=ctx.createGain();g.gain.value=2.0;node.connect(c);c.connect(g);node=g;}
+  const an=ctx.createAnalyser();an.fftSize=512;node.connect(an);
+  const dest=ctx.createMediaStreamDestination();node.connect(dest);
+  const buf=new Uint8Array(an.fftSize);
+  const draw=()=>{an.getByteTimeDomainData(buf);let p=0;for(const v of buf)p=Math.max(p,Math.abs(v-128));$('bar').style.width=Math.min(100,p/128*140)+'%';raf=requestAnimationFrame(draw)};draw();
+  rec=new MediaRecorder(dest.stream);chunks=[];rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  rec.onstop=finish;rec.start(1000);t0=Date.now();marks=[];running=true;
+  startSR();
+  $('rec').disabled=true;$('stop').disabled=false;$('mark').disabled=false;log('녹음 시작');
+ }catch(e){log('시작 실패: '+e.message);}
+};
+$('mark').onclick=()=>{marks.push(+el());finalText+=`\n--- [안건 ${marks.length+1} 시작 ${el()}초] ---\n`;$('txt').textContent=finalText;log(`안건 구분 ${marks.length} @ ${el()}초`);};
+$('stop').onclick=()=>{running=false;sr&&sr.stop();rec.stop();cancelAnimationFrame(raf);stream.getTracks().forEach(t=>t.stop());$('stop').disabled=true;$('mark').disabled=true;log('정지');};
+
+function startSR(){
+ const S=window.SpeechRecognition||window.webkitSpeechRecognition;if(!S){log('이 브라우저는 실시간 음성 인식 미지원');return;}
+ sr=new S();sr.lang='ko-KR';sr.continuous=true;sr.interimResults=true;
+ sr.onresult=e=>{let interim='';for(let i=e.resultIndex;i<e.results.length;i++){const r=e.results[i];if(r.isFinal)finalText+=r[0].transcript+' ';else interim+=r[0].transcript;}$('txt').textContent=finalText+interim;};
+ sr.onend=()=>{if(running)try{sr.start()}catch(_){}};sr.start();
+}
+
+async function finish(){
+ const blob=new Blob(chunks,{type:rec.mimeType});let outBlob=blob,ext=(rec.mimeType.includes('mp4')?'m4a':'webm');
+ if($('norm').checked){try{
+  const ab=await new (window.AudioContext||window.webkitAudioContext)().decodeAudioData(await blob.arrayBuffer());
+  const d=ab.getChannelData(0);let pk=0;for(const v of d)pk=Math.max(pk,Math.abs(v));
+  const k=pk>0?0.891/pk:1;outBlob=wav(d,ab.sampleRate,k);ext='wav';log(`정규화 x${k.toFixed(2)}`);
+ }catch(e){log('정규화 실패 → 원본 저장: '+e.message);}}
+ const stamp=new Date().toISOString().slice(0,16).replace(/[:T]/g,'');
+ const meta={recordedAt:new Date(t0).toISOString(),durationSec:+el(),agendaMarksSec:marks,options:Object.fromEntries(['agc','ns','ec','hp','comp','rnn','norm'].map(k=>[k,$(k).checked])),transcript:finalText.trim()};
+ dl(outBlob,`회의녹음_${stamp}.${ext}`,'녹음 파일 받기');
+ dl(new Blob([JSON.stringify(meta,null,2)],{type:'application/json'}),`회의녹음_${stamp}.json`,'텍스트·안건구분 JSON 받기');
+}
+function dl(b,n,l){const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n;a.textContent=l+' ('+n+')';$('out').appendChild(a);}
+function wav(d,rate,k){const b=new ArrayBuffer(44+d.length*2),v=new DataView(b);const w=(o,s)=>[...s].forEach((c,i)=>v.setUint8(o+i,c.charCodeAt(0)));
+ w(0,'RIFF');v.setUint32(4,36+d.length*2,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+ v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,d.length*2,true);
+ for(let i=0;i<d.length;i++){const s=Math.max(-1,Math.min(1,d[i]*k));v.setInt16(44+i*2,s<0?s*0x8000:s*0x7fff,true);}return new Blob([b],{type:'audio/wav'});}
+</script></body></html>
